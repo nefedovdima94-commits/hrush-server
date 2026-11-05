@@ -3,7 +3,8 @@
 // Admin: POST /admin/gift|event|event/stop|tp|kick|broadcast|warn|unwarn|ban|unban|promo|promo/delete|drop|auction/remove
 //        GET  /admin/players, GET /admin/bans, GET /admin/promos
 // WS /ws: hello, list, gift_ack, admin, ping, peer (пересылка игрок→игрок),
-//         set_title, auc_get, auc_list, auc_bid, auc_buy, auc_cancel, pvp_challenge, pvp_accept, pvp_decline, promo
+//         set_title, auc_get, auc_list, auc_bid, auc_buy, auc_cancel, pvp_challenge, pvp_accept, pvp_decline, promo,
+//         chat, clan_*, board_push/board_get, assist_*
 'use strict';
 const http = require('http');
 const fs = require('fs');
@@ -33,6 +34,10 @@ const DB = {
   promos: {},                   // CODE -> { code, money, item, qty, uses, used, until, message, by: {playerId: at} }
   known: {},                    // playerId -> { nick, ip, lastSeen }
   duels: {},                    // duelId -> открытый вызов (ставка вызвавшего в эскроу)
+  clans: {},                    // clanId -> { id, name, tag, leader, members: {pid: nick}, created }
+  clanOf: {},                   // playerId -> clanId
+  boards: { rich: {}, kills: {} }, // playerId -> { nick, v, at }
+  chat: [],                     // последние сообщения общего чата
 };
 try {
   const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
@@ -61,12 +66,16 @@ const clean = (s, max) => String(s ?? '').replace(/[\u0000-\u001f<>]/g, '').trim
 const int = (v, lo, hi, def = 0) => { const n = Math.floor(Number(v)); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : def; };
 const num = (v, lo, hi, def = 0) => { const n = Number(v); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : def; };
 const send = (ws, msg) => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg)); };
-const onlineList = () => [...online.values()].map(p => ({ playerId: p.playerId, nick: p.nick, since: p.connectedAt, title: p.title || '', lvl: p.lvl || 0 }));
+const onlineList = () => [...online.values()].map(p => ({
+  playerId: p.playerId, nick: p.nick, since: p.connectedAt, title: p.title || '', lvl: p.lvl || 0,
+  clanId: p.clanId || DB.clanOf[p.playerId] || '', clanTag: (DB.clans[p.clanId || DB.clanOf[p.playerId] || ''] || {}).tag || '',
+  money: p.money || 0, kills: p.kills || 0,
+}));
 const broadcast = (msg) => { const s = JSON.stringify(msg); for (const p of online.values()) if (p.ws.readyState === WebSocket.OPEN) p.ws.send(s); };
 const broadcastOnline = () => broadcast({ type: 'online', players: onlineList() });
 const eventIsActive = () => activeEvent && (!activeEvent.endsAt || activeEvent.endsAt > Date.now());
 const nickOf = id => online.get(id)?.nick || DB.known[id]?.nick || '?';
-const FEATURES = ['peer', 'auction', 'pvp', 'promo', 'mod', 'drop', 'title'];
+const FEATURES = ['peer', 'auction', 'pvp', 'promo', 'mod', 'drop', 'title', 'chat', 'clan', 'board', 'assist'];
 
 function checkKey(key) {
   if (!ADMIN_KEY || typeof key !== 'string') return false;
@@ -406,6 +415,179 @@ function handleReq(ws, m, fn) {
   send(ws, out);
 }
 
+
+// ---------- 💬 чат · 🏴 кланы · 🏆 рейтинги · 🆘 помощь в бою ----------
+const CHAT_MAX = 80;
+const assists = new Map(); // assistId -> fight
+
+function pushChat(room, from, nick, text, clanId) {
+  const msg = { id: crypto.randomUUID(), room, from, nick, text: clean(text, 200), clanId: clanId || '', at: Date.now() };
+  if (room === 'global') {
+    DB.chat.push(msg); if (DB.chat.length > CHAT_MAX) DB.chat = DB.chat.slice(-CHAT_MAX); persist();
+    broadcast({ type: 'chat', msg });
+  } else if (room === 'clan') {
+    const c = DB.clans[clanId]; if (!c) throw new Error('нет клана');
+    c.chat = c.chat || []; c.chat.push(msg); if (c.chat.length > 60) c.chat = c.chat.slice(-60); persist();
+    for (const pid of Object.keys(c.members || {})) {
+      const pl = online.get(pid); if (pl) send(pl.ws, { type: 'chat', msg });
+    }
+  }
+  return { msg };
+}
+function clanPublic(c) {
+  if (!c) return null;
+  return { id: c.id, name: c.name, tag: c.tag, leader: c.leader, members: Object.keys(c.members || {}).length, nicks: Object.values(c.members || {}).slice(0, 20) };
+}
+function clanCreate(pl, m) {
+  if (DB.clanOf[pl.playerId]) throw new Error('ты уже в клане');
+  const name = clean(m.name, 24); const tag = clean(m.tag || name.slice(0, 4), 6).toUpperCase();
+  if (!name || name.length < 2) throw new Error('имя клана 2–24 символа');
+  if (!tag || tag.length < 2) throw new Error('тег 2–6');
+  for (const c of Object.values(DB.clans)) if (c.tag === tag) throw new Error('тег занят');
+  const id = crypto.randomUUID().slice(0, 8);
+  const c = { id, name, tag, leader: pl.playerId, members: { [pl.playerId]: pl.nick }, created: Date.now(), chat: [] };
+  DB.clans[id] = c; DB.clanOf[pl.playerId] = id; pl.clanId = id; persist();
+  broadcastOnline();
+  return { clan: clanPublic(c) };
+}
+function clanJoin(pl, m) {
+  if (DB.clanOf[pl.playerId]) throw new Error('ты уже в клане');
+  const id = clean(m.clanId, 16);
+  const c = DB.clans[id]; if (!c) throw new Error('клан не найден');
+  if (Object.keys(c.members).length >= 20) throw new Error('клан полон (20)');
+  c.members[pl.playerId] = pl.nick; DB.clanOf[pl.playerId] = id; pl.clanId = id; persist();
+  broadcast({ type: 'sys', text: '🏴 ' + pl.nick + ' вступил в «' + c.name + '» [' + c.tag + ']' });
+  broadcastOnline();
+  return { clan: clanPublic(c) };
+}
+function clanLeave(pl) {
+  const id = DB.clanOf[pl.playerId]; if (!id) throw new Error('ты не в клане');
+  const c = DB.clans[id]; if (!c) { delete DB.clanOf[pl.playerId]; persist(); return { left: true }; }
+  delete c.members[pl.playerId]; delete DB.clanOf[pl.playerId]; pl.clanId = '';
+  if (c.leader === pl.playerId) {
+    const rest = Object.keys(c.members);
+    if (!rest.length) delete DB.clans[id];
+    else c.leader = rest[0];
+  }
+  persist(); broadcastOnline();
+  return { left: true, clan: clanPublic(DB.clans[id]) };
+}
+function clanList() { return { clans: Object.values(DB.clans).map(clanPublic).sort((a, b) => b.members - a.members).slice(0, 40) }; }
+function clanMine(pl) {
+  const id = DB.clanOf[pl.playerId]; const c = id && DB.clans[id];
+  return { clan: c ? { ...clanPublic(c), chat: (c.chat || []).slice(-30), memberList: c.members } : null };
+}
+function boardPush(pl, m) {
+  const money = num(m.money, 0, 1e15, 0);
+  const kills = int(m.kills, 0, 1e9, 0);
+  pl.money = money; pl.kills = kills;
+  const nick = pl.nick;
+  const now = Date.now();
+  const prevR = DB.boards.rich[pl.playerId];
+  const prevK = DB.boards.kills[pl.playerId];
+  if (!prevR || money >= (prevR.v || 0)) DB.boards.rich[pl.playerId] = { nick, v: money, at: now };
+  if (!prevK || kills >= (prevK.v || 0)) DB.boards.kills[pl.playerId] = { nick, v: kills, at: now };
+  // trim
+  for (const key of ['rich', 'kills']) {
+    const arr = Object.entries(DB.boards[key]).sort((a, b) => b[1].v - a[1].v);
+    if (arr.length > 100) {
+      DB.boards[key] = Object.fromEntries(arr.slice(0, 100));
+    }
+  }
+  persist();
+  broadcastOnline();
+  return { ok: true };
+}
+function boardGet() {
+  const top = (obj) => Object.entries(obj).map(([playerId, x]) => ({ playerId, nick: x.nick, v: x.v, at: x.at }))
+    .sort((a, b) => b.v - a.v).slice(0, 20);
+  return { rich: top(DB.boards.rich || {}), kills: top(DB.boards.kills || {}) };
+}
+function assistCall(pl, m) {
+  // один активный вызов на игрока
+  for (const [id, a] of assists) if (a.host === pl.playerId && a.status === 'open') { assists.delete(id); }
+  const enemy = {
+    name: clean(m.name, 48) || 'Враг',
+    maxHp: int(m.maxHp, 20, 500000, 100),
+    hp: int(m.hp, 1, 500000, 100),
+    dmg: int(m.dmg, 1, 50000, 10),
+    armor: int(m.armor, 0, 5000, 0),
+    level: int(m.level, 1, 99, 1),
+    loot: clean(m.loot, 24) || 'street',
+    money: num(m.money, 0.1, 20, 1),
+  };
+  enemy.hp = Math.min(enemy.hp, enemy.maxHp);
+  const id = crypto.randomUUID().slice(0, 10);
+  const a = { id, host: pl.playerId, hostNick: pl.nick, helpers: {}, enemy, status: 'open', at: Date.now(), hits: {} };
+  assists.set(id, a);
+  broadcast({ type: 'assist_open', assist: { id, host: a.host, hostNick: a.hostNick, enemy: { name: enemy.name, hp: enemy.hp, maxHp: enemy.maxHp, level: enemy.level } } });
+  return { assistId: id, enemy };
+}
+function assistJoin(pl, m) {
+  const id = clean(m.assistId, 16); const a = assists.get(id);
+  if (!a || a.status !== 'open') throw new Error('вызов закрыт');
+  if (a.host === pl.playerId) throw new Error('это твой бой');
+  if (Object.keys(a.helpers).length >= 4) throw new Error('уже 4 помощника');
+  a.helpers[pl.playerId] = pl.nick;
+  const members = [a.host, ...Object.keys(a.helpers)];
+  for (const pid of members) {
+    const t = online.get(pid); if (t) send(t.ws, { type: 'assist_update', assist: assistPublic(a) });
+  }
+  return { assist: assistPublic(a) };
+}
+function assistPublic(a) {
+  return {
+    id: a.id, host: a.host, hostNick: a.hostNick, status: a.status,
+    helpers: Object.entries(a.helpers).map(([playerId, nick]) => ({ playerId, nick })),
+    enemy: { name: a.enemy.name, hp: a.enemy.hp, maxHp: a.enemy.maxHp, level: a.enemy.level, dmg: a.enemy.dmg, armor: a.enemy.armor, loot: a.enemy.loot },
+  };
+}
+function assistHit(pl, m) {
+  const id = clean(m.assistId, 16); const a = assists.get(id);
+  if (!a || a.status !== 'open') throw new Error('бой закрыт');
+  if (pl.playerId !== a.host && !a.helpers[pl.playerId]) throw new Error('ты не в этом бою');
+  const dmg = int(m.dmg, 1, 1e7, 1);
+  a.enemy.hp = Math.max(0, a.enemy.hp - dmg);
+  a.hits[pl.playerId] = (a.hits[pl.playerId] || 0) + dmg;
+  const members = [a.host, ...Object.keys(a.helpers)];
+  const upd = { type: 'assist_update', assist: assistPublic(a), lastHit: { pid: pl.playerId, nick: pl.nick, dmg } };
+  for (const pid of members) { const t = online.get(pid); if (t) send(t.ws, upd); }
+  if (a.enemy.hp <= 0) return assistFinish(a, true);
+  return { assist: assistPublic(a) };
+}
+function assistFinish(a, won) {
+  if (a.status !== 'open') return { assist: assistPublic(a) };
+  a.status = won ? 'won' : 'lost';
+  const members = [a.host, ...Object.keys(a.helpers)];
+  const n = Math.max(1, members.length);
+  if (won) {
+    const pot = Math.floor((a.enemy.level * 120 + Math.random() * 150) * a.enemy.money);
+    const share = Math.max(1, Math.floor(pot / n));
+    for (const pid of members) {
+      deliver(pid, { money: share, force: 1, meta: { k: 'assist_loot', assistId: a.id }, message: '🆘 Доля за помощь против ' + a.enemy.name + ': +' + share + ' ₽ (из ' + n + ')' });
+    }
+    broadcast({ type: 'sys', text: '🆘 ' + a.hostNick + (Object.keys(a.helpers).length ? ' + братва' : '') + ' положили «' + a.enemy.name + '». Лут поделён на ' + n });
+  }
+  for (const pid of members) {
+    const t = online.get(pid); if (t) send(t.ws, { type: 'assist_end', assist: assistPublic(a), won: !!won });
+  }
+  setTimeout(() => assists.delete(a.id), 60000);
+  return { assist: assistPublic(a), won: !!won, shares: n };
+}
+function assistCancel(pl, m) {
+  const id = clean(m.assistId, 16); const a = assists.get(id);
+  if (!a) return { cancelled: true };
+  if (a.host !== pl.playerId) throw new Error('только хозяин боя');
+  a.status = 'cancel';
+  const members = [a.host, ...Object.keys(a.helpers)];
+  for (const pid of members) { const t = online.get(pid); if (t) send(t.ws, { type: 'assist_end', assist: assistPublic(a), won: false, reason: 'отменён' }); }
+  assists.delete(id);
+  return { cancelled: true };
+}
+function assistList() {
+  return { assists: [...assists.values()].filter(a => a.status === 'open').map(assistPublic).slice(0, 20) };
+}
+
 function adminDispatch(m) {
   switch (m.action) {
     case 'gift': return giveGift(m);
@@ -445,6 +627,9 @@ app.get('/', (req, res) => res.type('text').send(`Хрущевский Бесп�
 app.get('/health', (req, res) => res.json({ ok: true, online: online.size, uptimeSec: Math.round((Date.now() - startedAt) / 1000), features: FEATURES, lots: Object.keys(DB.lots).length }));
 app.get('/online', (req, res) => res.json({ players: onlineList() }));
 app.get('/auction', (req, res) => res.json({ lots: lotsPublic() }));
+app.get('/boards', (req, res) => res.json(boardGet()));
+app.get('/clans', (req, res) => res.json(clanList()));
+app.get('/chat', (req, res) => res.json({ chat: DB.chat.slice(-40) }));
 
 const admin = (req, res, next) => checkKey(req.get('x-admin-key')) ? next() : res.status(401).json({ error: 'bad admin key' });
 const wrap = fn => (req, res) => { try { res.json({ ok: true, ...fn(req.body || {}) }); } catch (e) { res.status(400).json({ error: e.message }); } };
@@ -491,12 +676,12 @@ wss.on('connection', (ws, req) => {
         if (ban) { send(ws, { type: 'banned', reason: ban.reason, until: ban.until }); try { ws.close(); } catch (_) {} return; }
         const prev = online.get(playerId);
         if (prev && prev.ws !== ws) { send(prev.ws, { type: 'kicked', reason: 'вход с другой вкладки' }); prev.ws.close(); }
-        ws.player = { ws, playerId, nick, connectedAt: Date.now(), title: clean(m.title, 32), lvl: int(m.lvl, 0, 9999, 0), ip: ws.ip };
+        ws.player = { ws, playerId, nick, connectedAt: Date.now(), title: clean(m.title, 32), lvl: int(m.lvl, 0, 9999, 0), ip: ws.ip, clanId: DB.clanOf[playerId] || '', money: 0, kills: 0 };
         online.set(playerId, ws.player);
         DB.known[playerId] = { nick, ip: ws.ip, lastSeen: Date.now() };
         const ks = Object.keys(DB.known); if (ks.length > 2000) delete DB.known[ks[0]];
         persist();
-        send(ws, { type: 'welcome', playerId, nick, players: onlineList(), event: eventIsActive() ? activeEvent : null, features: FEATURES, epoch: DB.epoch, warns: (DB.warns[playerId] || []).length, aucFee: AUC_FEE });
+        send(ws, { type: 'welcome', playerId, nick, players: onlineList(), event: eventIsActive() ? activeEvent : null, features: FEATURES, epoch: DB.epoch, warns: (DB.warns[playerId] || []).length, aucFee: AUC_FEE, clanId: DB.clanOf[playerId] || '', chat: DB.chat.slice(-20), boards: boardGet(), assists: assistList().assists });
         for (const gift of pendingGifts.get(playerId) || []) send(ws, { type: 'gift', gift });
         broadcastOnline();
         break;
@@ -538,6 +723,19 @@ wss.on('connection', (ws, req) => {
       case 'pvp_accept': if (!needHello()) handleReq(ws, m, () => pvpAccept(ws.player, m)); break;
       case 'pvp_decline': if (!needHello()) handleReq(ws, m, () => pvpDecline(ws.player, m)); break;
       case 'promo': if (!needHello()) handleReq(ws, m, () => promoUse(ws.player.playerId, m.code)); break;
+      case 'chat': if (!needHello()) handleReq(ws, m, () => pushChat(clean(m.room, 12) || 'global', ws.player.playerId, ws.player.nick, m.text, DB.clanOf[ws.player.playerId])); break;
+      case 'clan_create': if (!needHello()) handleReq(ws, m, () => clanCreate(ws.player, m)); break;
+      case 'clan_join': if (!needHello()) handleReq(ws, m, () => clanJoin(ws.player, m)); break;
+      case 'clan_leave': if (!needHello()) handleReq(ws, m, () => clanLeave(ws.player)); break;
+      case 'clan_list': if (!needHello()) handleReq(ws, m, () => clanList()); break;
+      case 'clan_mine': if (!needHello()) handleReq(ws, m, () => clanMine(ws.player)); break;
+      case 'board_push': if (!needHello()) handleReq(ws, m, () => boardPush(ws.player, m)); break;
+      case 'board_get': if (!needHello()) handleReq(ws, m, () => boardGet()); break;
+      case 'assist_call': if (!needHello()) handleReq(ws, m, () => assistCall(ws.player, m)); break;
+      case 'assist_join': if (!needHello()) handleReq(ws, m, () => assistJoin(ws.player, m)); break;
+      case 'assist_hit': if (!needHello()) handleReq(ws, m, () => assistHit(ws.player, m)); break;
+      case 'assist_cancel': if (!needHello()) handleReq(ws, m, () => assistCancel(ws.player, m)); break;
+      case 'assist_list': if (!needHello()) handleReq(ws, m, () => assistList()); break;
       case 'admin': {
         if (!checkKey(m.key)) return send(ws, { type: 'admin_result', ok: false, action: m.action, error: 'bad admin key' });
         try { send(ws, { type: 'admin_result', ok: true, action: m.action, ...adminDispatch(m) }); }
@@ -554,9 +752,14 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     if (ws.player && online.get(ws.player.playerId)?.ws === ws) {
-      online.delete(ws.player.playerId);
+      const pid = ws.player.playerId;
+      online.delete(pid);
       // открытый вызов на дуэль от вышедшего — отменяем (ставка вернётся подарком)
-      for (const d of duels.values()) if (d.a.pid === ws.player.playerId) duelCancel(d, 'вызвавший вышел', [d.b.pid]);
+      for (const d of duels.values()) if (d.a.pid === pid) duelCancel(d, 'вызвавший вышел', [d.b.pid]);
+      for (const [id, a] of [...assists.entries()]) {
+        if (a.host === pid && a.status === 'open') { try { assistCancel(ws.player, { assistId: id }); } catch (_) { assists.delete(id); } }
+        else if (a.helpers[pid]) { delete a.helpers[pid]; const members = [a.host, ...Object.keys(a.helpers)]; for (const x of members) { const t = online.get(x); if (t) send(t.ws, { type: 'assist_update', assist: assistPublic(a) }); } }
+      }
       broadcastOnline();
     }
   });

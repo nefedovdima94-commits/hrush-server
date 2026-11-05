@@ -125,7 +125,7 @@
         case 'peer_fail': try { H.onPeerFail(m); } catch (err) { console.error(err); } break;
         case 'req': try { H.onReq(m); } catch (err) { console.error(err); } break;
         case 'banned': stopped = true; H.banned = { reason: m.reason, until: m.until }; H.lastError = 'бан: ' + (m.reason || ''); try { H.onExtra(m); } catch (err) { console.error(err); } setStatus('banned'); break;
-        case 'auc_lots': case 'pvp_inv': case 'pvp_result': case 'pvp_cancel': case 'warned': case 'pong':
+        case 'auc_lots': case 'pvp_inv': case 'pvp_result': case 'pvp_cancel': case 'warned': case 'pong': case 'chat': case 'assist_open': case 'assist_update': case 'assist_end':
           if (m.type === 'warned') H.warns = m.count || H.warns;
           try { H.onExtra(m); } catch (err) { console.error(err); } break;
         case 'error': if (m.error === 'unknown type') { H.peerSupported = false; try { H.onPeerFail({ reason: 'server_old' }); } catch (err) {} } break;

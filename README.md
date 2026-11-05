@@ -1,6 +1,6 @@
 # Хрущевский Беспредел — онлайн-сервер
 
-Минимальный сервер: Node.js + Express + ws. Онлайн-список, подарки, ивенты, peer (трейд/рейд), аукцион, PvP на ставку, варны/баны, ивент-дроп и промокоды.
+Минимальный сервер: Node.js + Express + ws. Онлайн-список игроков, подарки от админа, глобальные ивенты.
 
 ## Файлы
 | Файл | Что это |
@@ -36,7 +36,7 @@ ADMIN_KEY=test npm test
 
 ### Особенности Free-тарифа
 - Сервис засыпает после ~15 минут без трафика; первый заход будит его до ~1 минуты. Клиент сам переподключается.
-- Очередь подарков, лоты, баны, варны, промокоды и открытые дуэли пишутся в `data.json`. На Free-тарифе диск эфемерный: файл пропадает при рестарте и редеплое, клиенты получают новый `epoch` и сами возвращают себе эскроу. Деньги и инвентарь игрок хранит у себя (localStorage). `ADMIN_KEY` задаётся только в Environment, в репозиторий не попадает.
+- Всё хранится в памяти: при рестарте/засыпании онлайн, очередь подарков и ивент сбрасываются. Деньги/инвентарь игрок хранит у себя в игре (localStorage).
 
 ## Подключение в игре
 ```html
@@ -45,8 +45,6 @@ ADMIN_KEY=test npm test
   HrushOnline.onOnline = players => console.log('Онлайн:', players);
   HrushOnline.onGift = g => { if (g.money) state.money += g.money; if (g.item) addItem(g.item, g.qty); };
   HrushOnline.onEvent = ev => showBanner(ev.name + ': ' + ev.text);
-  HrushOnline.onExtra = m => { /* auc_lots, pvp_inv, pvp_result, pvp_cancel, warned, banned */ };
-  HrushOnline.onReq = m => { /* ответ на HrushOnline.req: {reqId, op, ok, error} */ };
   HrushOnline.connect({ url: 'wss://hrush-server-xxxx.onrender.com/ws', nick: 'Петрович' });
 </script>
 ```
@@ -83,52 +81,39 @@ curl -X POST $S/admin/kick -H "x-admin-key: $K" -H "content-type: application/js
 # эфир всем
 curl -X POST $S/admin/broadcast -H "x-admin-key: $K" -H "content-type: application/json" \
   -d '{"text":"Внимание жильцам хрущёвки!"}'
-
-# варн (3 варна → автобан на сутки, если AUTO_BAN_WARNS не 0)
-curl -X POST $S/admin/warn -H "x-admin-key: $K" -H "content-type: application/json" \
-  -d '{"playerId":"ID","reason":"спам"}'
-curl -X POST $S/admin/unwarn -H "x-admin-key: $K" -H "content-type: application/json" \
-  -d '{"playerId":"ID"}'
-
-# бан (minutes: 0 = навсегда; byIp: true банит ещё и по IP)
-curl -X POST $S/admin/ban -H "x-admin-key: $K" -H "content-type: application/json" \
-  -d '{"playerId":"ID","minutes":60,"reason":"нарушение"}'
-curl -X POST $S/admin/unban -H "x-admin-key: $K" -H "content-type: application/json" \
-  -d '{"playerId":"ID"}'
-curl -H "x-admin-key: $K" $S/admin/bans
-
-# промокод
-curl -X POST $S/admin/promo -H "x-admin-key: $K" -H "content-type: application/json" \
-  -d '{"code":"HRUSH","money":250,"uses":100,"message":"привет"}'
-curl -H "x-admin-key: $K" $S/admin/promos
-curl -X POST $S/admin/promo/delete -H "x-admin-key: $K" -H "content-type: application/json" \
-  -d '{"code":"HRUSH"}'
-
-# разовый сундук всем онлайн
-curl -X POST $S/admin/drop -H "x-admin-key: $K" -H "content-type: application/json" \
-  -d '{"items":["Лом","Батон"],"qty":1,"message":"сундук"}'
-
-# снять лот
-curl -X POST $S/admin/auction/remove -H "x-admin-key: $K" -H "content-type: application/json" \
-  -d '{"lotId":"L........"}'
 ```
-Публично без ключа: `GET /health`, `GET /online`, `GET /auction`.
-
-Из игры (консоль браузера): `HrushOnline.adminGift(key, playerId, {money:500})`, `HrushOnline.adminEvent(key, {name:'Субботник'})`, `HrushOnline.req({type:'promo', code:'HRUSH'})`, `HrushOnline.req({type:'auc_list', item:{id,c,l,name}, buyout, start, durMin})`. Ключ в код игры не вшивать.
+Из игры (консоль браузера): `HrushOnline.adminGift(key, playerId, {money:500})`, `HrushOnline.adminEvent(key, {name:'Субботник'})`. Ключ в код игры не вшивать.
 
 ## Протокол WS (`/ws`, JSON)
-Клиент → сервер: `hello {playerId, nick, title?, lvl?}`, `set_title {title, lvl?}`, `list`, `gift_ack {giftId}`, `ping`, `peer {to, data:{k, tid?, ...}}`, `auc_get`, `auc_list|auc_bid|auc_buy|auc_cancel` (с `reqId`), `pvp_challenge|pvp_accept|pvp_decline` (с `reqId`), `promo {code, reqId}`, `admin {key, action, ...}`
-
-`admin.action`: `gift`, `event`, `event_stop`, `players`, `tp`, `kick`, `broadcast`, `warn`, `unwarn`, `ban`, `unban`, `bans`, `promo_create`, `promo_delete`, `promo_list`, `drop`, `auc_remove`, `auc_lots`
-
-Сервер → клиент: `welcome {playerId, players, event, features, epoch, warns, aucFee}`, `online`, `gift`, `event`, `event_end`, `tp`, `sys`, `peer`, `peer_ok`, `peer_fail`, `auc_lots`, `pvp_inv`, `pvp_result`, `pvp_cancel`, `warned`, `banned`, `req {reqId, op, ok, error?}`, `admin_result`, `kicked`, `pong`, `error`
-
-`features`: `peer`, `auction`, `pvp`, `promo`, `mod`, `drop`, `title`.
-
-`peer` — пересылка игрок→игрок (трейд/рейд), как раньше. Сервер не разбирает `data`, только проверяет `data.k` и что получатель онлайн.
-
-Аукцион и PvP: клиент сам списывает вещь или ставку (эскроу) и шлёт запрос с `reqId`. При `ok:false` клиент возвращает себе. Дальше сервер доставляет результат подарком (`gift.meta.k`: `auc_won`, `auc_sold`, `auc_return`, `auc_refund`, `pvp_win`, `pvp_refund`, `promo`, `drop`). Повтор того же `reqId` возвращает сохранённый ответ.
-
-Ивент-дроп: в `data.drop` поля `items`, `everySec` (30–3600), `chance`, `qty`. Пока ивент идёт, онлайн-игроки с этим шансом получают подарок. `POST /admin/drop` выдаёт сундук сразу.
+Клиент → сервер: `hello {playerId, nick}`, `list`, `gift_ack {giftId}`, `ping`, `admin {key, action: gift|event|event_stop|players|tp|kick|broadcast, ...}`
+Сервер → клиент: `welcome {playerId, players, event}`, `online {players}`, `gift {gift}`, `event {event}`, `event_end`, `tp {node,message}`, `sys {text}`, `admin_result`, `kicked`, `error`
 
 Подарок держится в очереди, пока клиент не пришлёт `gift_ack` (сниппет делает это сам и защищает от двойного начисления).
+
+## v2: аукцион · PvP · промо · варны/баны · дроп · титулы
+Фичи сервера (`welcome.features`): `peer, auction, pvp, promo, mod, drop, title`. Старый клиент работает как раньше.
+
+Состояние (лоты, баны, варны, промокоды, очередь подарков, открытые дуэли) пишется в `DATA_FILE` (по умолчанию `./data.json`).
+На Render Free диск эфемерный: при редеплое/перезапуске файл пропадает → меняется `epoch`, и клиенты сами возвращают себе
+выставленные вещи / замороженные ставки. Чтобы данные жили дольше — Render Disk (платно) и `DATA_FILE=/var/data/data.json`.
+
+Env: `AUC_FEE` (комиссия аукциона, по умолч. 0.05), `AUTO_BAN_WARNS` (по умолч. 3 → автобан на сутки; 0 = выкл).
+
+WS игрока: `auc_get`, `auc_list{item,buyout,start,durMin}`, `auc_bid{lotId,amount}`, `auc_buy`, `auc_cancel`,
+`pvp_challenge{to,stake,stats}`, `pvp_accept{duelId,stake,stats}`, `pvp_decline`, `promo{code}`, `set_title{title,lvl}` — все с `reqId`, ответ `{type:'req',reqId,ok,error}`.
+Админ (WS `admin` action или HTTP): `warn, unwarn, ban{minutes,byIp}, unban, bans, promo_create, promo_delete, promo_list, drop{items}, auc_remove{lotId}`.
+Ивент с дропом: `POST /admin/event {name, durationSec, data:{drop:{items:[...], everySec:120, chance:0.5, qty:1}}}`.
+
+```bash
+curl -H "x-admin-key: $K" -H 'content-type: application/json' -d '{"code":"HRUSH1","money":5000,"uses":100}' $S/admin/promo
+curl -H "x-admin-key: $K" -H 'content-type: application/json' -d '{"playerId":"...","minutes":1440,"reason":"читы"}' $S/admin/ban
+```
+
+
+## Новые фичи (чат / кланы / рейтинги / помощь)
+
+Features: `chat`, `clan`, `board`, `assist`.
+
+- WS: `chat`, `clan_create|join|leave|list|mine`, `board_push|board_get`, `assist_call|join|hit|cancel|list`
+- HTTP: `GET /boards`, `GET /clans`, `GET /chat`
+- Клиент: вкладка Онлайн → 💬 Чат · 🏴 Кланы · 🏆 Рейтинги; в бою кнопка 🆘 Звать на помощь
