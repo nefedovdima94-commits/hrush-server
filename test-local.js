@@ -19,6 +19,15 @@ const post = (p, body, key = KEY) => fetch(BASE + p, { method: 'POST', headers: 
   const wb = client('p-petya', 'Петя', b); await wait(300);
   const lastOnline = a.filter(m => m.type === 'online').pop();
   check(lastOnline && lastOnline.players.length === 2, 'список онлайн у Васи = 2');
+  const welcomeA = a.find(m => m.type === 'welcome');
+  check(welcomeA && Array.isArray(welcomeA.features) && welcomeA.features.includes('peer'), 'welcome сообщает peer');
+  wa.send(JSON.stringify({ type: 'peer', to: 'p-petya', data: { k: 'trade', tid: 't1', offer: 1 } }));
+  await wait(200);
+  check(b.some(m => m.type === 'peer' && m.from === 'p-vasya' && m.fromNick === 'Вася' && m.data && m.data.k === 'trade' && m.data.tid === 't1'), 'peer дошёл Пете');
+  check(a.some(m => m.type === 'peer_ok' && m.to === 'p-petya' && m.k === 'trade' && m.tid === 't1'), 'отправителю peer_ok');
+  wa.send(JSON.stringify({ type: 'peer', to: 'nobody', data: { k: 'raid', tid: 't2' } }));
+  await wait(200);
+  check(a.some(m => m.type === 'peer_fail' && m.to === 'nobody' && m.reason === 'offline' && m.k === 'raid' && m.tid === 't2'), 'офлайн → peer_fail');
   check((await post('/admin/gift', { playerId: 'p-petya', item: 'Лом', qty: 1 }, 'wrong'))[0] === 401, 'неверный ключ → 401');
   const [s, r] = await post('/admin/gift', { playerId: 'p-petya', item: 'Лом', qty: 2, money: 500, message: 'Держи' });
   await wait(200);

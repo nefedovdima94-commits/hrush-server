@@ -85,7 +85,9 @@ curl -X POST $S/admin/broadcast -H "x-admin-key: $K" -H "content-type: applicati
 Из игры (консоль браузера): `HrushOnline.adminGift(key, playerId, {money:500})`, `HrushOnline.adminEvent(key, {name:'Субботник'})`. Ключ в код игры не вшивать.
 
 ## Протокол WS (`/ws`, JSON)
-Клиент → сервер: `hello {playerId, nick}`, `list`, `gift_ack {giftId}`, `ping`, `admin {key, action: gift|event|event_stop|players|tp|kick|broadcast, ...}`
-Сервер → клиент: `welcome {playerId, players, event}`, `online {players}`, `gift {gift}`, `event {event}`, `event_end`, `tp {node,message}`, `sys {text}`, `admin_result`, `kicked`, `error`
+Клиент → сервер: `hello {playerId, nick}`, `list`, `gift_ack {giftId}`, `ping`, `peer {to, data:{k, tid?, ...}}`, `admin {key, action: gift|event|event_stop|players|tp|kick|broadcast, ...}`
+Сервер → клиент: `welcome {playerId, players, event, features:['peer']}`, `online {players}`, `gift {gift}`, `event {event}`, `event_end`, `tp {node,message}`, `sys {text}`, `peer {from, fromNick, data}`, `peer_ok`, `peer_fail` (если адресат офлайн), `admin_result`, `kicked`, `error`
+
+`peer` — пересылка игрок→игрок (трейд/рейд). Сервер не разбирает `data`, только проверяет `data.k` и что получатель онлайн. Клиент узнаёт поддержку по `features` в `welcome`.
 
 Подарок держится в очереди, пока клиент не пришлёт `gift_ack` (сниппет делает это сам и защищает от двойного начисления).

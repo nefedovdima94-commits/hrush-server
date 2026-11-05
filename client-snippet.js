@@ -10,36 +10,55 @@
  *   HrushOnline.onSys      = text => {...};      // системное сообщение / broadcast
  *   HrushOnline.onStatus   = s => {...};         // 'connecting' | 'online' | 'offline'
  *   HrushOnline.list();                          // запросить список онлайн
+ *   HrushOnline.peer(playerId, {k:'...', ...});  // сообщение другому игроку; HrushOnline.onPeer = m => {m.from, m.fromNick, m.data}
  *   HrushOnline.playerId                         // id игрока (хранится в localStorage)
  */
 (function () {
   var LS_ID = 'hrush_player_id', LS_NICK = 'hrush_nick';
   var ws = null, opts = {}, retry = 0, timer = null, stopped = false;
+  // localStorage может БРОСАТЬ исключение (Telegram/«HTML»-просмотрщик, sandbox-iframe, file://, приватный режим).
+  // Раньше это убивало весь клиент → window.HrushOnline не создавался → в профиле «нет клиента».
+  var _mem = {}, lsOk = true;
+  try { var _t = '__hrush_t'; window.localStorage.setItem(_t, '1'); window.localStorage.removeItem(_t); } catch (e) { lsOk = false; }
+  var LS = {
+    get: function (k) { if (lsOk) try { return window.localStorage.getItem(k); } catch (e) {} return _mem.hasOwnProperty(k) ? _mem[k] : null; },
+    set: function (k, v) { v = String(v); _mem[k] = v; if (lsOk) try { window.localStorage.setItem(k, v); } catch (e) {} }
+  };
 
   function genId() {
     return (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
       : 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
   }
-  var playerId = localStorage.getItem(LS_ID) || genId();
-  localStorage.setItem(LS_ID, playerId);
+  var playerId = LS.get(LS_ID) || genId();
+  LS.set(LS_ID, playerId);
 
   var H = {
     playerId: playerId,
     players: [],
     event: null,
     status: 'offline',
+    // диагностика для UI
+    storageOk: lsOk,                                   // false → ID живёт только до перезагрузки
+    wsSupported: typeof window.WebSocket === 'function' || typeof window.WebSocket === 'object',
+    lastError: '',                                     // текст последней ошибки соединения
+    retryAt: 0,                                        // когда следующая попытка (ms)
+    attempts: 0,
     onOnline: function () {}, onGift: null, onEvent: function () {},
     onEventEnd: function () {}, onStatus: function () {}, onAdminResult: function (r) { console.log('[admin]', r); },
     onTp: null, onSys: function () {},
+    // игрок → игрок через сервер (трейд/рейд). peerSupported: null=неизвестно, true/false
+    features: [], peerSupported: null,
+    onPeer: function () {}, onPeerFail: function () {}, onPeerOk: function () {},
+    peer: function (to, data) { if (!ws || ws.readyState !== 1) { try { H.onPeerFail({ to: to, k: data && data.k, tid: data && data.tid, reason: 'нет связи' }); } catch (e) {} return false; } raw({ type: 'peer', to: to, data: data }); return true; },
 
     connect: function (o) {
       opts = o || {}; stopped = false;
-      if (opts.nick) localStorage.setItem(LS_NICK, opts.nick);
+      if (opts.nick) LS.set(LS_NICK, opts.nick);
       open();
     },
     disconnect: function () { stopped = true; clearTimeout(timer); if (ws) ws.close(); },
     list: function () { raw({ type: 'list' }); },
-    setNick: function (nick) { localStorage.setItem(LS_NICK, nick); opts.nick = nick; hello(); },
+    setNick: function (nick) { LS.set(LS_NICK, nick); opts.nick = nick; hello(); },
     // админка из игры (ключ НЕ хранить в коде игры — вводить руками):
     adminGift: function (key, toPlayerId, gift) { raw(Object.assign({ type: 'admin', key: key, action: 'gift', playerId: toPlayerId }, gift)); },
     adminEvent: function (key, ev) { raw(Object.assign({ type: 'admin', key: key, action: 'event' }, ev)); },
@@ -52,17 +71,20 @@
 
   function setStatus(s) { H.status = s; try { H.onStatus(s); } catch (e) { console.error(e); } }
   function raw(msg) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); }
-  function hello() { raw({ type: 'hello', playerId: playerId, nick: opts.nick || localStorage.getItem(LS_NICK) || 'Жилец' }); }
+  function hello() { raw({ type: 'hello', playerId: playerId, nick: opts.nick || LS.get(LS_NICK) || 'Жилец' }); }
 
   function open() {
     if (!opts.url) return console.error('HrushOnline: нужен url');
+    if (!H.wsSupported) { H.lastError = 'WebSocket недоступен в этом просмотрщике'; setStatus('nows'); return; }
+    H.attempts++; H.retryAt = 0;
     setStatus('connecting');
-    try { ws = new WebSocket(opts.url); } catch (e) { return reconnect(); }
-    ws.onopen = function () { retry = 0; hello(); };
+    try { ws = new WebSocket(opts.url); } catch (e) { H.lastError = 'WebSocket заблокирован: ' + (e && e.message || e); setStatus('error'); return reconnect(); }
+    ws.onopen = function () { retry = 0; H.lastError = ''; hello(); };
     ws.onmessage = function (e) {
       var m; try { m = JSON.parse(e.data); } catch (_) { return; }
       switch (m.type) {
         case 'welcome':
+          H.features = m.features || []; H.peerSupported = H.features.indexOf('peer') >= 0;
           setStatus('online');
           H.players = m.players || []; H.onOnline(H.players);
           if (m.event) { H.event = m.event; H.onEvent(m.event); }
@@ -70,10 +92,10 @@
         case 'online': H.players = m.players || []; H.onOnline(H.players); break;
         case 'gift':
           // защита от двойного начисления при переподключении
-          var seen = JSON.parse(localStorage.getItem('hrush_gifts_seen') || '[]');
+          var seen = []; try { seen = JSON.parse(LS.get('hrush_gifts_seen') || '[]') || []; } catch (_) { seen = []; }
           if (seen.indexOf(m.gift.giftId) === -1) {
-            (H.onGift || defaultGift)(m.gift);
-            seen.push(m.gift.giftId); localStorage.setItem('hrush_gifts_seen', JSON.stringify(seen.slice(-200)));
+            try { (H.onGift || defaultGift)(m.gift); } catch (err) { console.error(err); }
+            seen.push(m.gift.giftId); LS.set('hrush_gifts_seen', JSON.stringify(seen.slice(-200)));
           }
           raw({ type: 'gift_ack', giftId: m.gift.giftId });
           break;
@@ -86,17 +108,25 @@
           try { H.onSys(m.text || ''); } catch (err) { console.error(err); }
           break;
         case 'admin_result': H.onAdminResult(m); break;
+        case 'peer': try { H.onPeer(m); } catch (err) { console.error(err); } break;
+        case 'peer_ok': try { H.onPeerOk(m); } catch (err) { console.error(err); } break;
+        case 'peer_fail': try { H.onPeerFail(m); } catch (err) { console.error(err); } break;
+        case 'error': if (m.error === 'unknown type') { H.peerSupported = false; try { H.onPeerFail({ reason: 'server_old' }); } catch (err) {} } break;
         case 'kicked': stopped = true; setStatus('offline'); console.warn('HrushOnline:', m.reason); try { H.onSys('Кик: ' + (m.reason || '')); } catch (_) {} break;
       }
     };
-    ws.onclose = function () { setStatus('offline'); if (!stopped) reconnect(); };
-    ws.onerror = function () { /* onclose сработает следом */ };
+    ws.onclose = function (ev) {
+      if (H.status === 'connecting' && !H.lastError) H.lastError = 'сервер не ответил' + (ev && ev.code ? ' (код ' + ev.code + ')' : '') + ' — Render может просыпаться ~50 с';
+      setStatus('offline'); if (!stopped) reconnect();
+    };
+    ws.onerror = function () { H.lastError = H.lastError || 'ошибка WebSocket (сеть/просмотрщик блокирует?)'; /* onclose сработает следом */ };
   }
 
   function reconnect() {
     clearTimeout(timer);
     // Render Free «просыпается» до ~50 сек — поэтому бэкофф до 30 сек
     var delay = Math.min(30000, 1000 * Math.pow(2, retry++));
+    H.retryAt = Date.now() + delay;
     timer = setTimeout(open, delay);
   }
 

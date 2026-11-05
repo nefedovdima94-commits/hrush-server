@@ -2,7 +2,7 @@
 // HTTP:  GET /, GET /health, GET /online
 // Admin: POST /admin/gift, POST /admin/event, POST /admin/event/stop,
 //        POST /admin/tp, POST /admin/kick, POST /admin/broadcast, GET /admin/players
-// WS:    тот же порт, путь /ws
+// WS:    тот же порт, путь /ws  (hello, list, gift_ack, admin, ping, peer — пересылка игрок→игрок)
 'use strict';
 const http = require('http');
 const crypto = require('crypto');
@@ -152,7 +152,7 @@ wss.on('connection', (ws) => {
         if (prev && prev.ws !== ws) { send(prev.ws, { type: 'kicked', reason: 'вход с другой вкладки' }); prev.ws.close(); }
         ws.player = { ws, playerId, nick, connectedAt: Date.now() };
         online.set(playerId, ws.player);
-        send(ws, { type: 'welcome', playerId, nick, players: onlineList(), event: eventIsActive() ? activeEvent : null });
+        send(ws, { type: 'welcome', playerId, nick, players: onlineList(), event: eventIsActive() ? activeEvent : null, features: ['peer'] });
         for (const gift of pendingGifts.get(playerId) || []) send(ws, { type: 'gift', gift });
         broadcastOnline();
         break;
@@ -160,6 +160,19 @@ wss.on('connection', (ws) => {
       case 'list':
         send(ws, { type: 'online', players: onlineList() });
         break;
+      case 'peer': { // игрок → игрок (трейд, приглашение в рейд, ходы рейда). Сервер только пересылает.
+        if (!ws.player) return send(ws, { type: 'peer_fail', reason: 'not hello' });
+        const to = clean(m.to, 64);
+        const data = (m.data && typeof m.data === 'object' && !Array.isArray(m.data)) ? m.data : null;
+        const k = data ? clean(data.k, 24) : '';
+        if (!to || !data || !k) return send(ws, { type: 'peer_fail', to, reason: 'bad peer msg' });
+        if (to === ws.player.playerId) return send(ws, { type: 'peer_fail', to, k, reason: 'self' });
+        const t = online.get(to);
+        if (!t) return send(ws, { type: 'peer_fail', to, k, tid: data.tid || null, reason: 'offline' });
+        send(t.ws, { type: 'peer', from: ws.player.playerId, fromNick: ws.player.nick, data, at: Date.now() });
+        send(ws, { type: 'peer_ok', to, k, tid: data.tid || null });
+        break;
+      }
       case 'gift_ack': { // клиент подтвердил получение подарка
         if (!ws.player) break;
         const q = (pendingGifts.get(ws.player.playerId) || []).filter(g => g.giftId !== m.giftId);
