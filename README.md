@@ -117,3 +117,14 @@ Features: `chat`, `clan`, `board`, `assist`.
 - WS: `chat`, `clan_create|join|leave|list|mine`, `board_push|board_get`, `assist_call|join|hit|cancel|list`
 - HTTP: `GET /boards`, `GET /clans`, `GET /chat`
 - Клиент: вкладка Онлайн → 💬 Чат · 🏴 Кланы · 🏆 Рейтинги; в бою кнопка 🆘 Звать на помощь
+
+## v33 CRIME WORLD — DM / налёты на хаты
+
+Features (`/health` → `features`): прежние `peer, auction, pvp, promo, mod, drop, title, chat, clan, board, assist` плюс `dm`, `house`. `ADMIN_KEY` по-прежнему только из окружения.
+
+- `dm {to,text}` — личные СМС игрок→игрок; если адресат офлайн — хранится (до 50 шт.) и приходит в `welcome.dms`.
+- `house_push {cash,items,def,lvl}` — клиент раз в 90 с / при сворачивании шлёт снимок своей хаты.
+- `house_list` — хаты офлайн-игроков (ур. ≥3, были ≤7 дней, не на кулдауне).
+- `house_raid {to,power,stl}` — налёт бригады на офлайн-хату: кд атакующего 10 мин, цели 3 ч, шанс 8–80%, забирает 8–20% нала хаты + 1–2 вещи; жертва получает удар в `welcome.houseHits` при входе.
+
+Новые поля в `data.json`: `dms`, `houses`, `houseHits`, `raidCd` (создаются автоматически, старые сохранения совместимы).

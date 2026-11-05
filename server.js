@@ -38,6 +38,10 @@ const DB = {
   clanOf: {},                   // playerId -> clanId
   boards: { rich: {}, kills: {} }, // playerId -> { nick, v, at }
   chat: [],                     // последние сообщения общего чата
+  dms: {},                      // playerId -> [{id, from, fromNick, text, at}] — личные СМС, ждут входа
+  houses: {},                   // playerId -> { nick, lvl, cash, items:[{id,c,v}], def, at } — снимок «хаты» для налётов офлайн
+  houseHits: {},                // playerId -> [{ id, fromNick, cash, items, ok, at }] — что вынесли, пока был офлайн
+  raidCd: {},                   // 'a:pid' / 't:pid' -> ts
 };
 try {
   const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
@@ -75,7 +79,7 @@ const broadcast = (msg) => { const s = JSON.stringify(msg); for (const p of onli
 const broadcastOnline = () => broadcast({ type: 'online', players: onlineList() });
 const eventIsActive = () => activeEvent && (!activeEvent.endsAt || activeEvent.endsAt > Date.now());
 const nickOf = id => online.get(id)?.nick || DB.known[id]?.nick || '?';
-const FEATURES = ['peer', 'auction', 'pvp', 'promo', 'mod', 'drop', 'title', 'chat', 'clan', 'board', 'assist'];
+const FEATURES = ['peer', 'auction', 'pvp', 'promo', 'mod', 'drop', 'title', 'chat', 'clan', 'board', 'assist', 'dm', 'house'];
 
 function checkKey(key) {
   if (!ADMIN_KEY || typeof key !== 'string') return false;
@@ -416,6 +420,61 @@ function handleReq(ws, m, fn) {
 }
 
 
+// ---------- 📱 личные СМС · 🏚️ хаты (налёты бригад на офлайн-игроков) ----------
+function dmSend(pl, m) {
+  const to = clean(m.to, 64), text = clean(m.text, 200);
+  if (!to || !text) throw new Error('пустое СМС');
+  if (to === pl.playerId) throw new Error('это ты сам');
+  if (!DB.known[to]) throw new Error('такого игрока сервер не знает');
+  const msg = { id: crypto.randomUUID(), from: pl.playerId, fromNick: pl.nick, text, at: Date.now() };
+  const t = online.get(to);
+  if (t) { send(t.ws, { type: 'dm', msg }); return { delivered: true }; }
+  const q = DB.dms[to] || (DB.dms[to] = []); q.push(msg); if (q.length > 50) DB.dms[to] = q.slice(-50); persist();
+  return { delivered: false };
+}
+function housePush(pl, m) {
+  const items = (Array.isArray(m.items) ? m.items : []).slice(0, 30).map(x => ({ id: clean(x && x.id, 40), c: int(x && x.c, 1, 999, 1), v: int(x && x.v, 0, 1e7, 0) })).filter(x => x.id);
+  DB.houses[pl.playerId] = { nick: pl.nick, lvl: int(m.lvl, 0, 9999, 0), cash: int(m.cash, 0, 1e10, 0), items, def: int(m.def, 0, 5000, 10), at: Date.now() };
+  persist(); return {};
+}
+function cashEst(c) { return c < 1000 ? 'пусто' : c < 10000 ? 'до 10к' : c < 50000 ? '10–50к' : c < 200000 ? '50–200к' : '200к+'; }
+function houseList(pl) {
+  const now = Date.now(), out = [];
+  for (const [pid, h] of Object.entries(DB.houses)) {
+    if (pid === pl.playerId || online.has(pid) || now - h.at > 7 * 864e5 || h.lvl < 3) continue;
+    if (h.cash < 500 && !h.items.length) continue;
+    out.push({ pid, nick: h.nick, lvl: h.lvl, cashEst: cashEst(h.cash), items: h.items.reduce((a, x) => a + x.c, 0), def: h.def, lastSeen: h.at, cd: Math.max(0, (DB.raidCd['t:' + pid] || 0) - now) });
+  }
+  out.sort((a, b) => b.lvl - a.lvl);
+  return { houses: out.filter(x => !x.cd).slice(0, 30) };
+}
+function houseRaid(pl, m) {
+  const to = clean(m.to, 64), now = Date.now(), h = DB.houses[to];
+  if (!h) throw new Error('хата не найдена');
+  if (to === pl.playerId) throw new Error('свою хату не грабят');
+  if (online.has(to)) throw new Error('хозяин дома (в сети) — нападай через «в сети»');
+  if (h.lvl < 3) throw new Error('новичок под защитой');
+  const ac = DB.raidCd['a:' + pl.playerId] || 0; if (now - ac < 10 * 60000) throw new Error('бригада ещё не вернулась (' + Math.ceil((10 * 60000 - (now - ac)) / 60000) + ' мин)');
+  const tc = DB.raidCd['t:' + to] || 0; if (now - tc < 3 * 3600000) throw new Error('эту хату недавно выносили — соседи начеку');
+  DB.raidCd['a:' + pl.playerId] = now; DB.raidCd['t:' + to] = now;
+  const power = int(m.power, 0, 5000, 0), stl = int(m.stl, 0, 500, 0);
+  const chance = Math.max(0.08, Math.min(0.8, (power + stl * 2) / (power + stl * 2 + h.def + 30)));
+  const hit = { id: crypto.randomUUID(), fromNick: pl.nick, cash: 0, items: [], ok: false, at: now };
+  const success = Math.random() < chance;
+  if (success) {
+    hit.ok = true;
+    hit.cash = Math.floor(h.cash * (0.08 + Math.random() * 0.12)); h.cash -= hit.cash;
+    const n = Math.min(h.items.length, 1 + (Math.random() < 0.4 ? 1 : 0));
+    for (let i = 0; i < n; i++) {
+      const k = Math.floor(Math.random() * h.items.length), it = h.items[k];
+      hit.items.push({ id: it.id }); if (it.c > 1) it.c--; else h.items.splice(k, 1);
+    }
+  }
+  const q = DB.houseHits[to] || (DB.houseHits[to] = []); q.push(hit); if (q.length > 30) DB.houseHits[to] = q.slice(-30);
+  persist();
+  return { success, cash: hit.cash, items: hit.items, chance: Math.round(chance * 100) };
+}
+
 // ---------- 💬 чат · 🏴 кланы · 🏆 рейтинги · 🆘 помощь в бою ----------
 const CHAT_MAX = 80;
 const assists = new Map(); // assistId -> fight
@@ -681,7 +740,8 @@ wss.on('connection', (ws, req) => {
         DB.known[playerId] = { nick, ip: ws.ip, lastSeen: Date.now() };
         const ks = Object.keys(DB.known); if (ks.length > 2000) delete DB.known[ks[0]];
         persist();
-        send(ws, { type: 'welcome', playerId, nick, players: onlineList(), event: eventIsActive() ? activeEvent : null, features: FEATURES, epoch: DB.epoch, warns: (DB.warns[playerId] || []).length, aucFee: AUC_FEE, clanId: DB.clanOf[playerId] || '', chat: DB.chat.slice(-20), boards: boardGet(), assists: assistList().assists });
+        send(ws, { type: 'welcome', playerId, nick, players: onlineList(), event: eventIsActive() ? activeEvent : null, features: FEATURES, epoch: DB.epoch, warns: (DB.warns[playerId] || []).length, aucFee: AUC_FEE, clanId: DB.clanOf[playerId] || '', chat: DB.chat.slice(-20), boards: boardGet(), assists: assistList().assists, dms: DB.dms[playerId] || [], houseHits: DB.houseHits[playerId] || [] });
+        if (DB.dms[playerId] || DB.houseHits[playerId]) { delete DB.dms[playerId]; delete DB.houseHits[playerId]; persist(); }
         for (const gift of pendingGifts.get(playerId) || []) send(ws, { type: 'gift', gift });
         broadcastOnline();
         break;
@@ -736,6 +796,10 @@ wss.on('connection', (ws, req) => {
       case 'assist_hit': if (!needHello()) handleReq(ws, m, () => assistHit(ws.player, m)); break;
       case 'assist_cancel': if (!needHello()) handleReq(ws, m, () => assistCancel(ws.player, m)); break;
       case 'assist_list': if (!needHello()) handleReq(ws, m, () => assistList()); break;
+      case 'dm': if (!needHello()) handleReq(ws, m, () => dmSend(ws.player, m)); break;
+      case 'house_push': if (!needHello()) { try { housePush(ws.player, m); } catch (_) {} } break;
+      case 'house_list': if (!needHello()) handleReq(ws, m, () => houseList(ws.player)); break;
+      case 'house_raid': if (!needHello()) handleReq(ws, m, () => houseRaid(ws.player, m)); break;
       case 'admin': {
         if (!checkKey(m.key)) return send(ws, { type: 'admin_result', ok: false, action: m.action, error: 'bad admin key' });
         try { send(ws, { type: 'admin_result', ok: true, action: m.action, ...adminDispatch(m) }); }

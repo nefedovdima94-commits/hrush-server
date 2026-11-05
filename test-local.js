@@ -14,14 +14,15 @@ const post = (p, body, key = KEY) => fetch(BASE + p, { method: 'POST', headers: 
 (async () => {
   let ok = true; const check = (c, name) => { console.log((c ? 'OK  ' : 'FAIL') + ' ' + name); ok = ok && c; };
   const health = await (await fetch(BASE + '/health')).json();
-  check(health.ok && ['peer', 'auction', 'pvp', 'promo', 'mod', 'drop'].every(f => (health.features || []).includes(f)), '/health market v2');
+  const prior = ['peer', 'auction', 'pvp', 'promo', 'mod', 'drop', 'title', 'chat', 'clan', 'board', 'assist'];
+  check(health.ok && [...prior, 'dm', 'house'].every(f => (health.features || []).includes(f)), '/health dm+house и прежние фичи');
   const a = [], b = [];
   const wa = client('p-vasya', 'Вася', a); await wait(200);
   const wb = client('p-petya', 'Петя', b); await wait(300);
   const lastOnline = a.filter(m => m.type === 'online').pop();
   check(lastOnline && lastOnline.players.length === 2, 'список онлайн у Васи = 2');
   const welcomeA = a.find(m => m.type === 'welcome');
-  check(welcomeA && ['peer', 'auction', 'pvp', 'promo', 'mod', 'drop', 'title'].every(f => (welcomeA.features || []).includes(f)), 'welcome: peer и market v2');
+  check(welcomeA && [...prior, 'dm', 'house'].every(f => (welcomeA.features || []).includes(f)), 'welcome: прежние фичи + dm/house');
   wa.send(JSON.stringify({ type: 'peer', to: 'p-petya', data: { k: 'trade', tid: 't1', offer: 1 } }));
   await wait(200);
   check(b.some(m => m.type === 'peer' && m.from === 'p-vasya' && m.fromNick === 'Вася' && m.data && m.data.k === 'trade' && m.data.tid === 't1'), 'peer дошёл Пете');
@@ -105,7 +106,34 @@ const post = (p, body, key = KEY) => fetch(BASE + p, { method: 'POST', headers: 
   const [us] = await post('/admin/unban', { playerId: 'p-ban' });
   check(us === 200, 'разбан');
   try { wban.close(); wban2.close(); } catch (_) {}
-  wb.close(); await wait(200);
+  // v33: СМС онлайн и в очередь, пока адресат офлайн
+  wa.send(JSON.stringify({ type: 'dm', reqId: 'dm1', to: 'p-petya', text: 'привет' }));
+  await wait(250);
+  check(a.some(m => m.type === 'req' && m.reqId === 'dm1' && m.ok && m.delivered), 'СМС онлайн доставлено');
+  check(b.some(m => m.type === 'dm' && m.msg && m.msg.from === 'p-vasya' && m.msg.text === 'привет'), 'СМС дошло Пете');
+  wb.close(); await wait(250);
+  wa.send(JSON.stringify({ type: 'dm', reqId: 'dm2', to: 'p-petya', text: 'ты где' }));
+  await wait(250);
+  check(a.some(m => m.type === 'req' && m.reqId === 'dm2' && m.ok && m.delivered === false), 'СМС офлайн в очередь');
+  const b2 = []; const wb2 = client('p-petya', 'Петя', b2); await wait(400);
+  const w2 = b2.find(m => m.type === 'welcome');
+  check(!!w2 && (w2.dms || []).some(d => d.text === 'ты где' && d.from === 'p-vasya'), 'офлайн-СМС в welcome.dms');
+  // хата офлайн-игрока и налёт бригады
+  wb2.send(JSON.stringify({ type: 'house_push', lvl: 5, cash: 20000, def: 10, items: [{ id: 'crowbar', c: 2, v: 100 }] }));
+  await wait(300);
+  wb2.close(); await wait(300);
+  wa.send(JSON.stringify({ type: 'house_list', reqId: 'hl1' }));
+  await wait(300);
+  const hl = a.find(m => m.type === 'req' && m.reqId === 'hl1');
+  check(!!hl && hl.ok && (hl.houses || []).some(h => h.pid === 'p-petya' && h.lvl === 5), 'house_list видит офлайн-хату');
+  wa.send(JSON.stringify({ type: 'house_raid', reqId: 'hr1', to: 'p-petya', power: 500, stl: 40 }));
+  await wait(300);
+  const hr = a.find(m => m.type === 'req' && m.reqId === 'hr1');
+  check(!!hr && hr.ok && typeof hr.success === 'boolean' && hr.chance >= 8 && hr.chance <= 80, 'house_raid ответил');
+  const b3 = []; const wb3 = client('p-petya', 'Петя', b3); await wait(400);
+  const w3 = b3.find(m => m.type === 'welcome');
+  check(!!w3 && (w3.houseHits || []).some(h => h.fromNick === 'Вася'), 'houseHits при входе');
+  try { wb3.close(); } catch (_) {}
   check(a.filter(m => m.type === 'online').pop().players.length >= 1, 'онлайн обновился после выходов');
   const pl = await (await fetch(BASE + '/admin/players', { headers: { 'x-admin-key': KEY } })).json();
   check(!pl.pending['p-petya'], 'подтверждённые подарки удалены из очереди');
