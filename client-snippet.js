@@ -1,0 +1,99 @@
+/* «Хрущевский Беспредел» — клиентский кусок для онлайна.
+ * Вставить в игру в <script> ... </script> (или подключить файлом).
+ *
+ *   HrushOnline.connect({ url: 'wss://ВАШ-СЕРВИС.onrender.com/ws', nick: 'Петрович' });
+ *   HrushOnline.onOnline   = players => {...};   // список онлайн [{playerId, nick, since}]
+ *   HrushOnline.onGift     = gift => {...};      // {giftId, item, qty, money, message}
+ *   HrushOnline.onEvent    = ev => {...};        // {id, name, text, data, endsAt}
+ *   HrushOnline.onEventEnd = () => {...};
+ *   HrushOnline.onStatus   = s => {...};         // 'connecting' | 'online' | 'offline'
+ *   HrushOnline.list();                          // запросить список онлайн
+ *   HrushOnline.playerId                         // id игрока (хранится в localStorage)
+ */
+(function () {
+  var LS_ID = 'hrush_player_id', LS_NICK = 'hrush_nick';
+  var ws = null, opts = {}, retry = 0, timer = null, stopped = false;
+
+  function genId() {
+    return (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
+      : 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+  }
+  var playerId = localStorage.getItem(LS_ID) || genId();
+  localStorage.setItem(LS_ID, playerId);
+
+  var H = {
+    playerId: playerId,
+    players: [],
+    event: null,
+    status: 'offline',
+    onOnline: function () {}, onGift: null, onEvent: function () {},
+    onEventEnd: function () {}, onStatus: function () {}, onAdminResult: function (r) { console.log('[admin]', r); },
+
+    connect: function (o) {
+      opts = o || {}; stopped = false;
+      if (opts.nick) localStorage.setItem(LS_NICK, opts.nick);
+      open();
+    },
+    disconnect: function () { stopped = true; clearTimeout(timer); if (ws) ws.close(); },
+    list: function () { raw({ type: 'list' }); },
+    setNick: function (nick) { localStorage.setItem(LS_NICK, nick); opts.nick = nick; hello(); },
+    // админка из игры (ключ НЕ хранить в коде игры — вводить руками):
+    adminGift: function (key, toPlayerId, gift) { raw(Object.assign({ type: 'admin', key: key, action: 'gift', playerId: toPlayerId }, gift)); },
+    adminEvent: function (key, ev) { raw(Object.assign({ type: 'admin', key: key, action: 'event' }, ev)); },
+    adminEventStop: function (key) { raw({ type: 'admin', key: key, action: 'event_stop' }); }
+  };
+
+  function setStatus(s) { H.status = s; try { H.onStatus(s); } catch (e) { console.error(e); } }
+  function raw(msg) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); }
+  function hello() { raw({ type: 'hello', playerId: playerId, nick: opts.nick || localStorage.getItem(LS_NICK) || 'Жилец' }); }
+
+  function open() {
+    if (!opts.url) return console.error('HrushOnline: нужен url');
+    setStatus('connecting');
+    try { ws = new WebSocket(opts.url); } catch (e) { return reconnect(); }
+    ws.onopen = function () { retry = 0; hello(); };
+    ws.onmessage = function (e) {
+      var m; try { m = JSON.parse(e.data); } catch (_) { return; }
+      switch (m.type) {
+        case 'welcome':
+          setStatus('online');
+          H.players = m.players || []; H.onOnline(H.players);
+          if (m.event) { H.event = m.event; H.onEvent(m.event); }
+          break;
+        case 'online': H.players = m.players || []; H.onOnline(H.players); break;
+        case 'gift':
+          // защита от двойного начисления при переподключении
+          var seen = JSON.parse(localStorage.getItem('hrush_gifts_seen') || '[]');
+          if (seen.indexOf(m.gift.giftId) === -1) {
+            (H.onGift || defaultGift)(m.gift);
+            seen.push(m.gift.giftId); localStorage.setItem('hrush_gifts_seen', JSON.stringify(seen.slice(-200)));
+          }
+          raw({ type: 'gift_ack', giftId: m.gift.giftId });
+          break;
+        case 'event': H.event = m.event; H.onEvent(m.event); break;
+        case 'event_end': H.event = null; H.onEventEnd(m.eventId); break;
+        case 'admin_result': H.onAdminResult(m); break;
+        case 'kicked': stopped = true; console.warn('HrushOnline:', m.reason); break;
+      }
+    };
+    ws.onclose = function () { setStatus('offline'); if (!stopped) reconnect(); };
+    ws.onerror = function () { /* onclose сработает следом */ };
+  }
+
+  function reconnect() {
+    clearTimeout(timer);
+    // Render Free «просыпается» до ~50 сек — поэтому бэкофф до 30 сек
+    var delay = Math.min(30000, 1000 * Math.pow(2, retry++));
+    timer = setTimeout(open, delay);
+  }
+
+  function defaultGift(g) {
+    var txt = 'Подарок от админа: ' + (g.item ? g.item + ' ×' + g.qty : '') + (g.money ? (g.item ? ', ' : '') + g.money + ' ₽' : '') + (g.message ? '\n' + g.message : '');
+    alert(txt);
+    // TODO: в игре заменить на начисление, например:
+    // if (g.money) state.money += g.money;
+    // if (g.item) addItem(g.item, g.qty);
+  }
+
+  window.HrushOnline = H;
+})();
