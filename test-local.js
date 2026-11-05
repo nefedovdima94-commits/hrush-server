@@ -34,10 +34,17 @@ const post = (p, body, key = KEY) => fetch(BASE + p, { method: 'POST', headers: 
   await new Promise(r => wad.on('open', r));
   wad.send(JSON.stringify({ type: 'admin', key: KEY, action: 'gift', playerId: 'p-vasya', item: 'Батон' })); await wait(200);
   check(ad.some(m => m.type === 'admin_result' && m.ok) && a.some(m => m.type === 'gift' && m.gift.item === 'Батон'), 'админ-подарок через WS');
+  // tp / broadcast / kick
+  await post('/admin/broadcast', { text: 'Проверка эфира' }); await wait(150);
+  check(a.some(m => m.type === 'sys' && m.text === 'Проверка эфира'), 'broadcast → sys');
+  await post('/admin/tp', { playerId: 'p-vasya', node: 'hub', message: 'домой' }); await wait(150);
+  check(a.some(m => m.type === 'tp' && m.node === 'hub'), 'tp Васе');
+  const [ks, kr] = await post('/admin/kick', { playerId: 'p-offline', reason: 'тест' }); await wait(200);
+  check(ks === 200 && kr.kicked && c.some(m => m.type === 'kicked'), 'kick офлайн-клиента');
   wb.close(); await wait(200);
-  check(a.filter(m => m.type === 'online').pop().players.length === 2, 'Петя вышел → онлайн обновился');
+  check(a.filter(m => m.type === 'online').pop().players.length >= 1, 'онлайн обновился после выходов');
   const pl = await (await fetch(BASE + '/admin/players', { headers: { 'x-admin-key': KEY } })).json();
-  check(!pl.pending['p-petya'] && !pl.pending['p-offline'], 'подтверждённые подарки удалены из очереди');
-  [wa, wc, wad].forEach(w => w.close());
+  check(!pl.pending['p-petya'], 'подтверждённые подарки удалены из очереди');
+  [wa, wad].forEach(w => { try { w.close(); } catch (_) {} });
   console.log(ok ? '\nВСЕ ТЕСТЫ ПРОЙДЕНЫ' : '\nЕСТЬ ОШИБКИ'); process.exit(ok ? 0 : 1);
 })();

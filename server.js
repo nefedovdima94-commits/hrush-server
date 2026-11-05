@@ -1,6 +1,7 @@
 // «Хрущевский Беспредел» — минимальный онлайн-сервер (Express + ws)
 // HTTP:  GET /, GET /health, GET /online
-// Admin: POST /admin/gift, POST /admin/event, GET /admin/players   (заголовок x-admin-key)
+// Admin: POST /admin/gift, POST /admin/event, POST /admin/event/stop,
+//        POST /admin/tp, POST /admin/kick, POST /admin/broadcast, GET /admin/players
 // WS:    тот же порт, путь /ws
 'use strict';
 const http = require('http');
@@ -73,6 +74,37 @@ function stopEvent() {
   return { stopped: !!was };
 }
 
+function tpPlayer({ playerId, node, message }) {
+  playerId = clean(playerId, 64);
+  node = clean(node, 64);
+  if (!playerId) throw new Error('playerId required');
+  if (!node) throw new Error('node required');
+  const p = online.get(playerId);
+  if (!p) throw new Error('player offline');
+  send(p.ws, { type: 'tp', node, message: clean(message, 200) });
+  return { delivered: true, playerId, node };
+}
+
+function kickPlayer({ playerId, reason }) {
+  playerId = clean(playerId, 64);
+  if (!playerId) throw new Error('playerId required');
+  const p = online.get(playerId);
+  if (!p) throw new Error('player offline');
+  const why = clean(reason, 200) || 'кикнут админом';
+  send(p.ws, { type: 'kicked', reason: why });
+  try { p.ws.close(); } catch (_) {}
+  online.delete(playerId);
+  broadcastOnline();
+  return { kicked: true, playerId, reason: why };
+}
+
+function broadcastSys({ text }) {
+  text = clean(text, 300);
+  if (!text) throw new Error('text required');
+  broadcast({ type: 'sys', text });
+  return { sentTo: online.size, text };
+}
+
 // ---------- HTTP ----------
 const app = express();
 app.use(express.json({ limit: '32kb' }));
@@ -94,6 +126,9 @@ app.get('/admin/players', admin, (req, res) => res.json({ players: onlineList(),
 app.post('/admin/gift', admin, wrap(giveGift));
 app.post('/admin/event', admin, wrap(startEvent));
 app.post('/admin/event/stop', admin, wrap(stopEvent));
+app.post('/admin/tp', admin, wrap(tpPlayer));
+app.post('/admin/kick', admin, wrap(kickPlayer));
+app.post('/admin/broadcast', admin, wrap(broadcastSys));
 
 // ---------- WebSocket ----------
 const server = http.createServer(app);
@@ -131,13 +166,16 @@ wss.on('connection', (ws) => {
         q.length ? pendingGifts.set(ws.player.playerId, q) : pendingGifts.delete(ws.player.playerId);
         break;
       }
-      case 'admin': { // админка прямо из игры: {type:'admin', key, action:'gift'|'event'|'event_stop'|'players', ...}
+      case 'admin': { // админка прямо из игры
         if (!checkKey(m.key)) return send(ws, { type: 'admin_result', ok: false, error: 'bad admin key' });
         try {
           const r = m.action === 'gift' ? giveGift(m)
             : m.action === 'event' ? startEvent(m)
             : m.action === 'event_stop' ? stopEvent()
             : m.action === 'players' ? { players: onlineList() }
+            : m.action === 'tp' ? tpPlayer(m)
+            : m.action === 'kick' ? kickPlayer(m)
+            : m.action === 'broadcast' ? broadcastSys(m)
             : (() => { throw new Error('unknown action'); })();
           send(ws, { type: 'admin_result', ok: true, action: m.action, ...r });
         } catch (e) { send(ws, { type: 'admin_result', ok: false, error: e.message }); }

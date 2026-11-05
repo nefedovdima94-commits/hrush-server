@@ -69,11 +69,23 @@ curl -X POST $S/admin/event -H "x-admin-key: $K" -H "content-type: application/j
 
 # остановить ивент
 curl -X POST $S/admin/event/stop -H "x-admin-key: $K"
+
+# телепорт онлайн-игрока в node игры
+curl -X POST $S/admin/tp -H "x-admin-key: $K" -H "content-type: application/json" \
+  -d '{"playerId":"ID","node":"hub","message":"Домой"}'
+
+# кик
+curl -X POST $S/admin/kick -H "x-admin-key: $K" -H "content-type: application/json" \
+  -d '{"playerId":"ID","reason":"нарушение"}'
+
+# эфир всем
+curl -X POST $S/admin/broadcast -H "x-admin-key: $K" -H "content-type: application/json" \
+  -d '{"text":"Внимание жильцам хрущёвки!"}'
 ```
 Из игры (консоль браузера): `HrushOnline.adminGift(key, playerId, {money:500})`, `HrushOnline.adminEvent(key, {name:'Субботник'})`. Ключ в код игры не вшивать.
 
 ## Протокол WS (`/ws`, JSON)
-Клиент → сервер: `hello {playerId, nick}`, `list`, `gift_ack {giftId}`, `ping`, `admin {key, action: gift|event|event_stop|players, ...}`
-Сервер → клиент: `welcome {playerId, players, event}`, `online {players}`, `gift {gift}`, `event {event}`, `event_end`, `admin_result`, `kicked`, `error`
+Клиент → сервер: `hello {playerId, nick}`, `list`, `gift_ack {giftId}`, `ping`, `admin {key, action: gift|event|event_stop|players|tp|kick|broadcast, ...}`
+Сервер → клиент: `welcome {playerId, players, event}`, `online {players}`, `gift {gift}`, `event {event}`, `event_end`, `tp {node,message}`, `sys {text}`, `admin_result`, `kicked`, `error`
 
 Подарок держится в очереди, пока клиент не пришлёт `gift_ack` (сниппет делает это сам и защищает от двойного начисления).

@@ -6,6 +6,8 @@
  *   HrushOnline.onGift     = gift => {...};      // {giftId, item, qty, money, message}
  *   HrushOnline.onEvent    = ev => {...};        // {id, name, text, data, endsAt}
  *   HrushOnline.onEventEnd = () => {...};
+ *   HrushOnline.onTp       = ({node, message}) => {...};
+ *   HrushOnline.onSys      = text => {...};      // системное сообщение / broadcast
  *   HrushOnline.onStatus   = s => {...};         // 'connecting' | 'online' | 'offline'
  *   HrushOnline.list();                          // запросить список онлайн
  *   HrushOnline.playerId                         // id игрока (хранится в localStorage)
@@ -28,6 +30,7 @@
     status: 'offline',
     onOnline: function () {}, onGift: null, onEvent: function () {},
     onEventEnd: function () {}, onStatus: function () {}, onAdminResult: function (r) { console.log('[admin]', r); },
+    onTp: null, onSys: function () {},
 
     connect: function (o) {
       opts = o || {}; stopped = false;
@@ -40,7 +43,11 @@
     // админка из игры (ключ НЕ хранить в коде игры — вводить руками):
     adminGift: function (key, toPlayerId, gift) { raw(Object.assign({ type: 'admin', key: key, action: 'gift', playerId: toPlayerId }, gift)); },
     adminEvent: function (key, ev) { raw(Object.assign({ type: 'admin', key: key, action: 'event' }, ev)); },
-    adminEventStop: function (key) { raw({ type: 'admin', key: key, action: 'event_stop' }); }
+    adminEventStop: function (key) { raw({ type: 'admin', key: key, action: 'event_stop' }); },
+    adminPlayers: function (key) { raw({ type: 'admin', key: key, action: 'players' }); },
+    adminTp: function (key, playerId, node, message) { raw({ type: 'admin', key: key, action: 'tp', playerId: playerId, node: node, message: message || '' }); },
+    adminKick: function (key, playerId, reason) { raw({ type: 'admin', key: key, action: 'kick', playerId: playerId, reason: reason || '' }); },
+    adminBroadcast: function (key, text) { raw({ type: 'admin', key: key, action: 'broadcast', text: text }); }
   };
 
   function setStatus(s) { H.status = s; try { H.onStatus(s); } catch (e) { console.error(e); } }
@@ -72,8 +79,14 @@
           break;
         case 'event': H.event = m.event; H.onEvent(m.event); break;
         case 'event_end': H.event = null; H.onEventEnd(m.eventId); break;
+        case 'tp':
+          try { (H.onTp || defaultTp)(m); } catch (err) { console.error(err); }
+          break;
+        case 'sys':
+          try { H.onSys(m.text || ''); } catch (err) { console.error(err); }
+          break;
         case 'admin_result': H.onAdminResult(m); break;
-        case 'kicked': stopped = true; console.warn('HrushOnline:', m.reason); break;
+        case 'kicked': stopped = true; setStatus('offline'); console.warn('HrushOnline:', m.reason); try { H.onSys('Кик: ' + (m.reason || '')); } catch (_) {} break;
       }
     };
     ws.onclose = function () { setStatus('offline'); if (!stopped) reconnect(); };
@@ -90,9 +103,16 @@
   function defaultGift(g) {
     var txt = 'Подарок от админа: ' + (g.item ? g.item + ' ×' + g.qty : '') + (g.money ? (g.item ? ', ' : '') + g.money + ' ₽' : '') + (g.message ? '\n' + g.message : '');
     alert(txt);
-    // TODO: в игре заменить на начисление, например:
-    // if (g.money) state.money += g.money;
-    // if (g.item) addItem(g.item, g.qty);
+  }
+
+  function defaultTp(m) {
+    try {
+      if (typeof p !== 'undefined' && p) {
+        p.node = m.node;
+        if (typeof showLog === 'function') showLog('📡 ТП: ' + m.node + (m.message ? ' — ' + m.message : ''));
+        if (typeof renderAll === 'function') renderAll();
+      }
+    } catch (e) { console.error(e); }
   }
 
   window.HrushOnline = H;
